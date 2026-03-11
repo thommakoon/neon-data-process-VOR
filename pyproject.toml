@@ -1,0 +1,13 @@
+[project]
+name = "neon"
+version = "0.1.0"
+description = "Gaze analysis with interactive velocity plot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "numpy>=1.24",
+]
+

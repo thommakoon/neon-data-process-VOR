@@ -1,0 +1,21 @@
+# Ignore everything under dataset/ except sample/ and this repo's README
+dataset/*
+!dataset/README.md
+!dataset/sample/
+!dataset/sample/**
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.egg-info/
+.eggs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
