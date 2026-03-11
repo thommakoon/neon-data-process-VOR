@@ -2,6 +2,8 @@
 
 Gaze analysis with interactive velocity plot for Neon eye-tracking recordings.
 
+**This project is powered by AI** (e.g. Cursor) for development and documentation.
+
 ## Setup
 
 - Python ≥ 3.10
