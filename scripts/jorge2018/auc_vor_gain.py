@@ -15,14 +15,17 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 try:
     from scipy.signal import butter, filtfilt
+    from scipy.ndimage import median_filter as ndimage_median_filter
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
+    ndimage_median_filter = None
 
 TS_COL = "timestamp [ns]"
 GAZE_AZI = "azimuth [deg]"
@@ -52,6 +55,23 @@ class VelData:
     """Prepared velocity data for both eye and head."""
     eye: EyeVelData
     head: HeadVelData | None
+
+
+@dataclass
+class AUCResult:
+    """AUC-based VOR gain (Jorge Rey-Martinez et al. / original/analizeVOR.m)."""
+    gain_pos: float  # left side (head > 0)
+    gain_neg: float  # right side (head < 0)
+    desac_eye_azi: np.ndarray  # desaccaded eye velocity on common time
+    time_s: np.ndarray
+    head_azi: np.ndarray  # head velocity on common time (aligned to eye)
+    # Segments actually used for trapezoid integration
+    pos_t: np.ndarray
+    pos_h: np.ndarray
+    pos_e: np.ndarray
+    neg_t: np.ndarray
+    neg_h: np.ndarray
+    neg_e: np.ndarray
 
 
 def lowpass_filter(
@@ -189,6 +209,168 @@ def prepare_vel_data(
     return VelData(eye=eye, head=head)
 
 
+def _desaccade_median(eye_vel: np.ndarray, vvor: bool = True) -> np.ndarray:
+    """
+    Desaccade eye velocity with 1D median filter (matches original analizeVOR.m).
+    VVOR: kernel 30, VORS: kernel 35.
+    """
+    if not _HAS_SCIPY or ndimage_median_filter is None:
+        return eye_vel
+    k = 30 if vvor else 35
+    # kernel size must be odd for symmetric behavior; MATLAB medfilt1(30) uses 30
+    k = k + 1 if k % 2 == 0 else k
+    return ndimage_median_filter(eye_vel.astype(float), size=k, mode="nearest")
+
+
+def compute_auc_gains(
+    data: VelData,
+    axis: str = "azi",
+    vvor: bool = True,
+    eye_opposite_head: bool = True,
+) -> AUCResult | None:
+    """
+    Compute AUC-based VOR gains (Jorge Rey-Martinez et al. / original/analizeVOR.m).
+
+    Aligns head to eye time, desaccades eye velocity with median filter, splits by
+    head sign (positive = left, negative = right), then gain = area(eye)/area(head)
+    per side using trapezoidal integration.
+
+    In the reference (ICS Impulse / analizeVOR.m), eye and head velocity have the
+    *same* sign during compensatory VOR. In Neon data, gaze velocity is typically
+    *opposite* to head velocity. Use eye_opposite_head=True (default) to negate eye
+    so that compensatory movement matches the reference and gains are positive for normal VOR.
+
+    - axis: "azi" (horizontal) or "elev" (vertical).
+    - vvor: True for VVOR (median kernel 30), False for VORS (kernel 35).
+    - eye_opposite_head: True if in your data eye and head are opposite during VOR
+      (Neon convention); then eye is negated for the AUC split so gain > 0 = compensatory.
+    Returns None if head data is missing.
+    """
+    if data.head is None:
+        return None
+    t_eye = data.eye.time_s
+    if axis == "azi":
+        e = data.eye.vel_azi.copy()
+        h_t = data.head.vel_azi
+        t_head = data.head.time_s
+    else:
+        e = data.eye.vel_elev.copy()
+        h_t = data.head.vel_elev
+        t_head = data.head.time_s
+    # Neon: eye (gaze) and head are opposite during VOR; reference expects same sign
+    if eye_opposite_head:
+        e = -e
+    # Align head to eye time (interpolate)
+    h = np.interp(t_eye, t_head, h_t)
+    
+    # desac_e = _desaccade_median(e, vvor=vvor) # median filter after low-pass filtering --> redundant?
+    desac_e = e
+    
+    # Split by head sign; when head > 0 only count eye if eye > 0, else 0; same for neg
+    pos_mask = h > 0
+    neg_mask = h < 0
+    pos_t = t_eye[pos_mask]
+    pos_h = h[pos_mask]
+    pos_e = np.where(desac_e[pos_mask] > 0, desac_e[pos_mask], 0.0)
+    neg_t = t_eye[neg_mask]
+    neg_h = h[neg_mask]
+    neg_e = np.where(desac_e[neg_mask] < 0, desac_e[neg_mask], 0.0)
+    # AUC gain = trapz(eye) / trapz(head) per side (match MATLAB trapz behavior)
+    if len(pos_t) < 2:
+        gain_pos = float("nan")
+    else:
+        auc_pos_eye = np.trapezoid(pos_e, pos_t)
+        auc_pos_head = np.trapezoid(pos_h, pos_t)
+        gain_pos = (auc_pos_eye / auc_pos_head) if abs(auc_pos_head) > 1e-12 else float("nan")
+    if len(neg_t) < 2:
+        gain_neg = float("nan")
+    else:
+        auc_neg_eye = np.trapezoid(neg_e, neg_t)
+        auc_neg_head = np.trapezoid(neg_h, neg_t)
+        gain_neg = (auc_neg_eye / auc_neg_head) if abs(auc_neg_head) > 1e-12 else float("nan")
+    return AUCResult(
+        gain_pos=gain_pos,
+        gain_neg=gain_neg,
+        desac_eye_azi=desac_e,
+        time_s=t_eye,
+        head_azi=h,
+        pos_t=pos_t,
+        pos_h=pos_h,
+        pos_e=pos_e,
+        neg_t=neg_t,
+        neg_h=neg_h,
+        neg_e=neg_e,
+    )
+
+
+def plot_auc_trapezoid_data(
+    auc: AUCResult,
+    axis_label: str = "azi",
+    out_path: Path | str | None = None,
+    show: bool = True,
+) -> None:
+    """
+    Plot the head and desaccaded eye velocity used for trapezoid (AUC) integration.
+    Top: full trace with regions shaded (left = head>0, right = head<0).
+    Bottom: left and right segments that are actually integrated.
+    """
+    t, h, e = auc.time_s, auc.head_azi, auc.desac_eye_azi
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex="col")
+    fig.suptitle(f"AUC trapezoid input (horizontal = {axis_label}) | Left gain: {auc.gain_pos:.3f}  Right gain: {auc.gain_neg:.3f}")
+
+    # Full trace with shaded regions
+    ax0 = axes[0]
+    ax0.plot(t, h, "b-", label="Head vel", lw=1.2, alpha=0.9)
+    ax0.plot(t, e, "r-", label="Desaccaded eye vel", lw=1.2, alpha=0.9)
+    # Shade contiguous regions: head > 0 (left) and head < 0 (right)
+    pos_mask = h > 0
+    neg_mask = h < 0
+    for i in range(len(t) - 1):
+        if pos_mask[i] or pos_mask[i + 1]:
+            ax0.axvspan(t[i], t[i + 1], alpha=0.12, color="blue")
+        if neg_mask[i] or neg_mask[i + 1]:
+            ax0.axvspan(t[i], t[i + 1], alpha=0.12, color="orange")
+    ax0.axhline(0, color="k", ls=":", alpha=0.5)
+    ax0.set_ylabel("Velocity (deg/s)")
+    ax0.set_title("Full trace: head & desaccaded eye (blue shade = head>0, orange = head<0)")
+    ax0.legend(loc="upper right", fontsize=8)
+    ax0.grid(True, alpha=0.3)
+
+    # Left segment (used for gain_pos)
+    ax1 = axes[1]
+    if len(auc.pos_t) >= 2:
+        ax1.plot(auc.pos_t, auc.pos_h, "b-", label="Head", lw=1.2)
+        ax1.plot(auc.pos_t, auc.pos_e, "r-", label="Eye (in integral)", lw=1.2)
+        ax1.fill_between(auc.pos_t, 0, auc.pos_h, alpha=0.2, color="b")
+        ax1.fill_between(auc.pos_t, 0, auc.pos_e, alpha=0.2, color="r")
+    ax1.axhline(0, color="k", ls=":", alpha=0.5)
+    ax1.set_ylabel("Velocity (deg/s)")
+    ax1.set_title("Left (head > 0) — curves used for trapezoid → left gain")
+    ax1.legend(loc="upper right", fontsize=8)
+    ax1.grid(True, alpha=0.3)
+
+    # Right segment (used for gain_neg)
+    ax2 = axes[2]
+    if len(auc.neg_t) >= 2:
+        ax2.plot(auc.neg_t, auc.neg_h, "b-", label="Head", lw=1.2)
+        ax2.plot(auc.neg_t, auc.neg_e, "r-", label="Eye (in integral)", lw=1.2)
+        ax2.fill_between(auc.neg_t, 0, auc.neg_h, alpha=0.2, color="b")
+        ax2.fill_between(auc.neg_t, 0, auc.neg_e, alpha=0.2, color="r")
+    ax2.axhline(0, color="k", ls=":", alpha=0.5)
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Velocity (deg/s)")
+    ax2.set_title("Right (head < 0) — curves used for trapezoid → right gain")
+    ax2.legend(loc="upper right", fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if out_path is not None:
+        plt.savefig(Path(out_path), dpi=150, bbox_inches="tight")
+        print(f"Saved AUC trapezoid plot to {out_path}")
+    if show:
+        plt.show()
+
+
 def main() -> None:
     # scripts/jorge2018/auc_vor_gain.py -> project root = parent.parent.parent
     project_root = Path(__file__).resolve().parent.parent.parent
@@ -196,15 +378,21 @@ def main() -> None:
         project_root
         / "dataset"
         / "neon-player-export"
-        / "2026-03-13-15-24-38"
-        / "2026-03-13_16-22-32_export"
+        / "2026-03-11-16-47-08"
+        / "2026-03-11_18-32-13_export"
+        
+        # / "2026-03-13-15-24-38"
+        # / "2026-03-13_16-22-32_export"
     )
     default_zero = (
         project_root
         / "dataset"
         / "neon-player-export"
-        / "2026-03-13-15-24-38"
-        / "2026-03-13_16-19-38_export"
+        / "2026-03-11-16-47-08"
+        / "2026-03-11_18-42-14_export"
+        
+        # / "2026-03-13-15-24-38"
+        # / "2026-03-13_16-19-38_export"
     )
 
     parser = argparse.ArgumentParser(
@@ -227,7 +415,7 @@ def main() -> None:
     parser.add_argument(
         "--lowpass-cutoff",
         type=float,
-        default=5.0,
+        default=1.0,
         metavar="HZ",
         help="Low-pass cutoff [Hz] for velocity (0 = disable)",
     )
@@ -237,6 +425,26 @@ def main() -> None:
         default=2,
         metavar="N",
         help="Low-pass filter order",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        default=True,
+        help="Plot AUC trapezoid input (default: True)",
+    )
+    parser.add_argument(
+        "--no-plot",
+        action="store_false",
+        dest="plot",
+        help="Do not show AUC plot",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Save AUC trapezoid plot to file",
     )
     args = parser.parse_args()
 
@@ -257,6 +465,16 @@ def main() -> None:
         print(f"  time_s: shape={data.head.time_s.shape}, range=[{data.head.time_s.min():.2f}, {data.head.time_s.max():.2f}] s")
         print(f"  vel_azi [deg/s]: shape={data.head.vel_azi.shape}, range=[{np.nanmin(data.head.vel_azi):.2f}, {np.nanmax(data.head.vel_azi):.2f}]")
         print(f"  vel_elev [deg/s]: shape={data.head.vel_elev.shape}, range=[{np.nanmin(data.head.vel_elev):.2f}, {np.nanmax(data.head.vel_elev):.2f}]")
+        # AUC method (Jorge Rey-Martinez et al. / original/analizeVOR.m)
+        auc = compute_auc_gains(data, axis="azi", vvor=True)
+        if auc is not None:
+            print("AUC VOR gain (horizontal, VVOR):")
+            print(f"  Left (pos head):  {auc.gain_pos:.4f}")
+            print(f"  Right (neg head): {auc.gain_neg:.4f}")
+            if args.plot or args.output is not None:
+                plot_auc_trapezoid_data(
+                    auc, axis_label="azi", out_path=args.output, show=args.plot
+                )
     else:
         print("Head velocity: not available (no imu.csv or missing yaw/pitch).")
 
