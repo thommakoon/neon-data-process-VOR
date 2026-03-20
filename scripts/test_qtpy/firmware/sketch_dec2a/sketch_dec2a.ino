@@ -58,8 +58,7 @@ void setup() {
   configureICM(icm2);
 
   Serial.println("\nAll devices initialized!");
-  Serial.println("   Time(us) |   AccX1   AccY1   AccZ1 |  GyroX1  GyroY1  GyroZ1 |   AccX2   AccY2   AccZ2 |  GyroX2  GyroY2  GyroZ2");
-  Serial.println("------------+-------------------------+-------------------------+-------------------------+-------------------------");
+  Serial.println("Time,AccX1,AccY1,AccZ1,GyroX1,GyroY1,GyroZ1,MagX1,MagY1,MagZ1,AccX2,AccY2,AccZ2,GyroX2,GyroY2,GyroZ2,MagX2,MagY2,MagZ2");
 }
 
 void configureICM(Adafruit_ICM20948 &icm) {
@@ -76,23 +75,25 @@ void loop() {
   if (currentTime - lastTime >= 12500) {
     lastTime = currentTime;
     
-    sensors_event_t accel1, gyro1, temp1;
-    sensors_event_t accel2, gyro2, temp2;
+    sensors_event_t accel1, gyro1, temp1, mag1;
+    sensors_event_t accel2, gyro2, temp2, mag2;
 
     // Port 0의 센서 읽기
     myMux.setPort(0);
-    icm1.getEvent(&accel1, &gyro1, &temp1);
+    icm1.getEvent(&accel1, &gyro1, &temp1, &mag1);
     
     // Port 1의 센서 읽기
     myMux.setPort(1);
-    icm2.getEvent(&accel2, &gyro2, &temp2);
+    icm2.getEvent(&accel2, &gyro2, &temp2, &mag2);
     
-    // 고정 폭 출력으로 각 열을 세로 정렬
-    Serial.printf("%11lu | %7.2f %7.2f %7.2f | %7.2f %7.2f %7.2f | %7.2f %7.2f %7.2f | %7.2f %7.2f %7.2f\n",
+    // CSV 출력 (PC logger가 LF/RF 포맷으로 분리 저장)
+    Serial.printf("%lu,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
       currentTime,
       accel1.acceleration.x, accel1.acceleration.y, accel1.acceleration.z,
       gyro1.gyro.x, gyro1.gyro.y, gyro1.gyro.z,
+      mag1.magnetic.x, mag1.magnetic.y, mag1.magnetic.z,
       accel2.acceleration.x, accel2.acceleration.y, accel2.acceleration.z,
-      gyro2.gyro.x, gyro2.gyro.y, gyro2.gyro.z);
+      gyro2.gyro.x, gyro2.gyro.y, gyro2.gyro.z,
+      mag2.magnetic.x, mag2.magnetic.y, mag2.magnetic.z);
   }
 }

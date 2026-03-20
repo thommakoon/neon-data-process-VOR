@@ -9,21 +9,38 @@ from pathlib import Path
 import serial
 
 
-CSV_COLUMNS = [
-    "Time",
-    "AccX1",
-    "AccY1",
-    "AccZ1",
-    "GyroX1",
-    "GyroY1",
-    "GyroZ1",
-    "AccX2",
-    "AccY2",
-    "AccZ2",
-    "GyroX2",
-    "GyroY2",
-    "GyroZ2",
+OUTPUT_COLUMNS = [
+    "PacketCounter",
+    "SampleTimeFine",
+    "Quat_W",
+    "Quat_X",
+    "Quat_Y",
+    "Quat_Z",
+    "dq_W",
+    "dq_X",
+    "dq_Y",
+    "dq_Z",
+    "dv[1]",
+    "dv[2]",
+    "dv[3]",
+    "Acc_X",
+    "Acc_Y",
+    "Acc_Z",
+    "Gyr_X",
+    "Gyr_Y",
+    "Gyr_Z",
+    "Mag_X",
+    "Mag_Y",
+    "Mag_Z",
+    "Status",
 ]
+
+
+def write_xsens_like_header(writer):
+    # Mimic Xsens-style metadata preface with 7 empty rows.
+    for _ in range(7):
+        writer.writerow([])
+    writer.writerow(OUTPUT_COLUMNS)
 
 
 def parse_line(line: str):
@@ -43,31 +60,82 @@ def parse_line(line: str):
     ):
         return None
 
-    # CSV mode: 13 comma-separated values
+    # CSV mode:
+    # - 13 values: Time + (Acc/Gyro)*2
+    # - 19 values: Time + (Acc/Gyro/Mag)*2
     if "," in line:
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) == 13:
+        if len(parts) in (13, 19):
             return parts
         return None
 
     # Aligned table mode: extract all numbers in order
     nums = re.findall(r"[-+]?\d*\.?\d+", line)
+    if len(nums) >= 19:
+        return nums[:19]
     if len(nums) >= 13:
         return nums[:13]
 
     return None
 
 
-def resolve_output_path(output_path: str | None, output_dir: str) -> Path:
-    if output_path:
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-
+def resolve_output_paths(output_dir: str) -> tuple[Path, Path]:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return out_dir / f"imu_data_{ts}.csv"
+    return out_dir / "LF.csv", out_dir / "RF.csv"
+
+
+def split_lf_rf_row(parsed, packet_counter: int):
+    # Incoming order:
+    # 13 cols:
+    # Time,AccX1,AccY1,AccZ1,GyroX1,GyroY1,GyroZ1,AccX2,AccY2,AccZ2,GyroX2,GyroY2,GyroZ2
+    # 19 cols:
+    # Time,AccX1,AccY1,AccZ1,GyroX1,GyroY1,GyroZ1,MagX1,MagY1,MagZ1,
+    #      AccX2,AccY2,AccZ2,GyroX2,GyroY2,GyroZ2,MagX2,MagY2,MagZ2
+    sample_time = parsed[0]
+    has_mag = len(parsed) >= 19
+
+    # Fields unavailable from current firmware are filled with 0.
+    lf = [
+        packet_counter,
+        sample_time,
+        0, 0, 0, 0,      # Quat_W..Quat_Z
+        0, 0, 0, 0,      # dq_W..dq_Z
+        0, 0, 0,         # dv[1]..dv[3]
+        parsed[1],       # Acc_X
+        parsed[2],       # Acc_Y
+        parsed[3],       # Acc_Z
+        parsed[4],       # Gyr_X
+        parsed[5],       # Gyr_Y
+        parsed[6],       # Gyr_Z
+        parsed[7] if has_mag else 0,   # Mag_X
+        parsed[8] if has_mag else 0,   # Mag_Y
+        parsed[9] if has_mag else 0,   # Mag_Z
+        0,               # Status
+    ]
+
+    acc2_start = 10 if has_mag else 7
+    gyr2_start = 13 if has_mag else 10
+    mag2_start = 16 if has_mag else -1
+
+    rf = [
+        packet_counter,
+        sample_time,
+        0, 0, 0, 0,      # Quat_W..Quat_Z
+        0, 0, 0, 0,      # dq_W..dq_Z
+        0, 0, 0,         # dv[1]..dv[3]
+        parsed[acc2_start],       # Acc_X
+        parsed[acc2_start + 1],   # Acc_Y
+        parsed[acc2_start + 2],   # Acc_Z
+        parsed[gyr2_start],       # Gyr_X
+        parsed[gyr2_start + 1],   # Gyr_Y
+        parsed[gyr2_start + 2],   # Gyr_Z
+        parsed[mag2_start] if has_mag else 0,       # Mag_X
+        parsed[mag2_start + 1] if has_mag else 0,   # Mag_Y
+        parsed[mag2_start + 2] if has_mag else 0,   # Mag_Z
+        0,               # Status
+    ]
+    return lf, rf
 
 
 def main():
@@ -83,31 +151,30 @@ def main():
         help="Recording seconds (0 means until Ctrl+C)",
     )
     parser.add_argument(
-        "--output",
-        default=None,
-        help="Output CSV path. If omitted, auto-creates file in --output-dir",
-    )
-    parser.add_argument(
         "--output-dir",
         default="scripts/test_qtpy/data",
-        help="Directory for auto-named CSV",
+        help="Directory where LF.csv and RF.csv are saved",
     )
     args = parser.parse_args()
 
-    out_path = resolve_output_path(args.output, args.output_dir)
+    lf_path, rf_path = resolve_output_paths(args.output_dir)
     print(f"Opening {args.port} @ {args.baud}")
-    print(f"Saving CSV to: {out_path}")
+    print(f"Saving LF CSV to: {lf_path}")
+    print(f"Saving RF CSV to: {rf_path}")
     print("Press Ctrl+C to stop.")
 
     rows_written = 0
+    packet_counter = 0
     start_t = time.time()
 
     try:
         with serial.Serial(args.port, args.baud, timeout=1) as ser, open(
-            out_path, "w", newline="", encoding="utf-8"
-        ) as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_COLUMNS)
+            lf_path, "w", newline="", encoding="utf-8"
+        ) as lf_file, open(rf_path, "w", newline="", encoding="utf-8") as rf_file:
+            lf_writer = csv.writer(lf_file)
+            rf_writer = csv.writer(rf_file)
+            write_xsens_like_header(lf_writer)
+            write_xsens_like_header(rf_writer)
 
             while True:
                 if args.duration > 0 and (time.time() - start_t) >= args.duration:
@@ -118,8 +185,11 @@ def main():
                 if parsed is None:
                     continue
 
-                writer.writerow(parsed)
+                lf_row, rf_row = split_lf_rf_row(parsed, packet_counter)
+                lf_writer.writerow(lf_row)
+                rf_writer.writerow(rf_row)
                 rows_written += 1
+                packet_counter += 1
 
                 if rows_written % 50 == 0:
                     print(f"Recorded {rows_written} rows...", flush=True)
@@ -130,7 +200,7 @@ def main():
         print(f"Serial error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Done. Wrote {rows_written} rows to {out_path}")
+    print(f"Done. Wrote {rows_written} rows to {lf_path} and {rf_path}")
 
 
 if __name__ == "__main__":
